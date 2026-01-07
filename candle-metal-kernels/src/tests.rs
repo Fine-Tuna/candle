@@ -33,6 +33,37 @@ fn with_command_buffer_respects_compute_per_buffer() {
     commands.wait_until_completed().unwrap();
 }
 
+#[test]
+fn untracked_command_buffer_manual_commit() {
+    let device = device();
+    let command_queue = device.new_command_queue().unwrap();
+    let commands = Commands::new(command_queue).unwrap();
+
+    // Create an untracked CB and record multiple encoders on it without pool accounting.
+    let cb = commands.new_untracked_command_buffer().unwrap();
+
+    // Blit: fill a tiny buffer to ensure the CB has real GPU work.
+    let buf = device
+        .new_buffer(16, RESOURCE_OPTIONS_SHARED)
+        .expect("buffer alloc");
+    let blit = cb.blit_command_encoder();
+    blit.fill_buffer(&buf, (0, buf.length()), 0);
+    blit.end_encoding();
+
+    // Compute: open/close a compute encoder on the same CB (no pipeline needed for the test).
+    let compute = cb.compute_command_encoder();
+    compute.set_label("noop-compute");
+    compute.end_encoding();
+
+    // Single commit/wait for all recorded work.
+    cb.commit();
+    cb.wait_until_completed();
+
+    // Verify buffer was written by the blit encoder.
+    let data = unsafe { std::slice::from_raw_parts(buf.contents(), buf.length()) };
+    assert!(data.iter().all(|&b| b == 0));
+}
+
 
 fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     let ptr = buffer.contents() as *const T;

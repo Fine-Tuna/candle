@@ -9,6 +9,7 @@ use std::{ffi::c_void, ptr, sync::Arc};
 pub struct ComputeCommandEncoder {
     raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
     semaphore: Arc<CommandSemaphore>,
+    ended: std::cell::Cell<bool>,
 }
 
 impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
@@ -21,7 +22,11 @@ impl ComputeCommandEncoder {
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         semaphore: Arc<CommandSemaphore>,
     ) -> ComputeCommandEncoder {
-        ComputeCommandEncoder { raw, semaphore }
+        ComputeCommandEncoder {
+            raw,
+            semaphore,
+            ended: std::cell::Cell::new(false),
+        }
     }
 
     pub(crate) fn signal_encoding_ended(&self) {
@@ -79,6 +84,9 @@ impl ComputeCommandEncoder {
     }
 
     pub fn end_encoding(&self) {
+        if self.ended.replace(true) {
+            return;
+        }
         use objc2_metal::MTLCommandEncoder as _;
         self.raw.endEncoding();
         self.signal_encoding_ended();
@@ -103,6 +111,7 @@ impl Drop for ComputeCommandEncoder {
 pub struct BlitCommandEncoder {
     raw: Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>,
     semaphore: Arc<CommandSemaphore>,
+    ended: std::cell::Cell<bool>,
 }
 
 impl AsRef<BlitCommandEncoder> for BlitCommandEncoder {
@@ -116,7 +125,11 @@ impl BlitCommandEncoder {
         raw: Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>,
         semaphore: Arc<CommandSemaphore>,
     ) -> BlitCommandEncoder {
-        BlitCommandEncoder { raw, semaphore }
+        BlitCommandEncoder {
+            raw,
+            semaphore,
+            ended: std::cell::Cell::new(false),
+        }
     }
 
     pub(crate) fn signal_encoding_ended(&self) {
@@ -124,6 +137,9 @@ impl BlitCommandEncoder {
     }
 
     pub fn end_encoding(&self) {
+        if self.ended.replace(true) {
+            return;
+        }
         use objc2_metal::MTLCommandEncoder as _;
         self.raw.endEncoding();
         self.signal_encoding_ended();

@@ -4,7 +4,8 @@ use crate::{
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDevice};
-use std::{ffi::c_void, ptr};
+use std::ffi::c_void;
+use std::ptr;
 
 #[derive(Clone, Debug)]
 pub struct Device {
@@ -80,6 +81,42 @@ impl Device {
             .unwrap();
 
         Ok(Library::new(raw))
+    }
+
+    /// Load a precompiled Metal library from binary data (metallib format).
+    ///
+    /// This creates a DispatchData from the byte slice and uses it to load
+    /// a precompiled .metallib file. For embedded metallibs (static data),
+    /// use `new_library_with_static_data` for efficiency.
+    pub fn new_library_with_data(&self, data: &[u8]) -> Result<Library, MetalKernelError> {
+        use dispatch2::DispatchData;
+
+        // Create DispatchData from the byte slice (copies the data)
+        let dispatch_data = DispatchData::from_bytes(data);
+
+        self.as_ref()
+            .newLibraryWithData_error(&dispatch_data)
+            .map(Library::new)
+            .map_err(|e| MetalKernelError::FailedToCreateResource(format!("Library: {:?}", e)))
+    }
+
+    /// Load a precompiled Metal library from static binary data (metallib format).
+    ///
+    /// This is more efficient than `new_library_with_data` for embedded metallibs
+    /// as it avoids copying the data.
+    pub fn new_library_with_static_data(
+        &self,
+        data: &'static [u8],
+    ) -> Result<Library, MetalKernelError> {
+        use dispatch2::DispatchData;
+
+        // Create DispatchData from static bytes (no copy)
+        let dispatch_data = DispatchData::from_static_bytes(data);
+
+        self.as_ref()
+            .newLibraryWithData_error(&dispatch_data)
+            .map(Library::new)
+            .map_err(|e| MetalKernelError::FailedToCreateResource(format!("Library: {:?}", e)))
     }
 
     pub fn new_compute_pipeline_state_with_function(

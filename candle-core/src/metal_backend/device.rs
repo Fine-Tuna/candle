@@ -1,13 +1,16 @@
 use crate::{DType, Result};
 use candle_metal_kernels::{
     metal::{
-        BlitCommandEncoder, Buffer, BufferMap, Commands, ComputeCommandEncoder, ComputePipeline,
-        Device, MTLResourceOptions,
+        BlitCommandEncoder, Buffer, BufferMap, CommandBuffer, Commands, ComputeCommandEncoder,
+        ComputePipeline, Device, MTLResourceOptions,
     },
     Kernels,
 };
+use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSURL;
-use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
+use objc2_metal::{
+    MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager, MTLCommandBuffer, MTLCommandQueue,
+};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -165,6 +168,35 @@ impl MetalDevice {
 
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
+    }
+
+    /// Borrow the raw Metal command queue (single queue for this device).
+    pub fn raw_command_queue(&self) -> Result<objc2::rc::Retained<ProtocolObject<dyn MTLCommandQueue>>> {
+        let commands = self.commands.read().map_err(MetalError::from)?;
+        Ok(commands.raw_command_queue().clone())
+    }
+
+    /// Create a brand-new command buffer that is not tracked by the pool.
+    /// Caller is responsible for commit/wait.
+    pub fn new_untracked_command_buffer(
+        &self,
+    ) -> Result<CommandBuffer> {
+        let commands = self.commands.read().map_err(MetalError::from)?;
+        Ok(commands
+            .new_untracked_command_buffer()
+            .map_err(MetalError::from)?)
+    }
+
+    /// Run a closure with a freshly created, untracked command buffer (no pool accounting).
+    /// Caller is responsible for commit/wait on the buffer.
+    pub fn with_command_buffer_untracked<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&ProtocolObject<dyn MTLCommandBuffer>) -> R,
+    {
+        let commands = self.commands.read().map_err(MetalError::from)?;
+        Ok(commands
+            .with_command_buffer_untracked(f)
+            .map_err(MetalError::from)?)
     }
 
     pub fn device(&self) -> &Device {
