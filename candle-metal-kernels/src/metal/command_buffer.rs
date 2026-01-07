@@ -117,6 +117,12 @@ impl CommandBuffer {
     pub fn wait_until_completed(&self) {
         self.raw.waitUntilCompleted();
     }
+
+    /// Get a clone of the semaphore for this command buffer.
+    /// Useful when creating a new CommandBuffer that should share coordination.
+    pub fn semaphore(&self) -> Arc<CommandSemaphore> {
+        Arc::clone(&self.semaphore)
+    }
 }
 
 impl AsRef<ProtocolObject<dyn MTLCommandBuffer>> for CommandBuffer {

@@ -3,10 +3,10 @@
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
-use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
+use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape, Error};
 use candle_metal_kernels::{
     metal::{Buffer, Commands, Device},
-    BufferOffset, CallConvTranspose2dCfg, Kernels, RESOURCE_OPTIONS,
+    BufferOffset, CallConvTranspose2dCfg, Kernels, RESOURCE_OPTIONS_SHARED,
 };
 use objc2_foundation::NSRange;
 use std::collections::HashMap;
@@ -1680,6 +1680,7 @@ impl BackendStorage for MetalStorage {
         rhs_l: &Layout,
     ) -> Result<Self> {
         let buffer = self.device.new_buffer(b * m * n, self.dtype, "matmul")?;
+
         let encoder = self.device.command_encoder()?;
         encoder.set_label("matmul");
         let dtype = match self.dtype {
@@ -1909,7 +1910,8 @@ impl MetalStorage {
 
     pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
         let size = self.count * self.dtype.size_in_bytes();
-        let buffer = self.device.allocate_buffer(size)?;
+        // Use a dedicated CPU-visible buffer for readback to keep primary storage in Private memory.
+        let buffer = self.device.allocate_shared_buffer(size)?;
         {
             let blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
@@ -1925,7 +1927,17 @@ impl BackendDevice for MetalDevice {
     type Storage = MetalStorage;
 
     fn new(ordinal: usize) -> Result<Self> {
-        let device = Device::all().swap_remove(ordinal);
+        let mut devices = Device::all();
+        if devices.is_empty() {
+            return Err(Error::Msg("no Metal devices available".to_string()));
+        }
+        if ordinal >= devices.len() {
+            return Err(Error::Msg(format!(
+                "requested Metal device {ordinal} but only {} available",
+                devices.len()
+            )));
+        }
+        let device = devices.swap_remove(ordinal);
         let command_queue = device.new_command_queue().map_err(MetalError::from)?;
         let kernels = Arc::new(Kernels::new());
         let seed = Arc::new(Mutex::new(
@@ -1933,7 +1945,7 @@ impl BackendDevice for MetalDevice {
                 .new_buffer_with_data(
                     [299792458u64].as_ptr() as *const c_void,
                     4,
-                    RESOURCE_OPTIONS,
+                    RESOURCE_OPTIONS_SHARED,
                 )
                 .map_err(MetalError::from)?,
         ));

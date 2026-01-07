@@ -4,14 +4,16 @@ use crate::{DType, Result};
 use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
-        BlitCommandEncoder, Buffer, BufferMap, Commands, ComputeCommandEncoder, Device,
-        MTLResourceOptions,
+        BlitCommandEncoder, Buffer, BufferMap, CommandBuffer, Commands, ComputeCommandEncoder,
+        ComputePipeline, Device, MTLResourceOptions,
     },
     Kernels,
 };
+use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSURL;
-use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
-
+use objc2_metal::{
+    MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager, MTLCommandBuffer, MTLCommandQueue,
+};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -65,8 +67,13 @@ pub struct MetalDevice {
     pub(crate) seed_value: Arc<RwLock<u64>>,
 }
 
-// Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
-pub const RESOURCE_OPTIONS: MTLResourceOptions =
+// Resource options used for creating buffers.
+// - `RESOURCE_OPTIONS_DEFAULT`: performance-oriented GPU storage (Private).
+// - `RESOURCE_OPTIONS_SHARED`: CPU-visible storage used for readback or small control data.
+pub const RESOURCE_OPTIONS_DEFAULT: MTLResourceOptions =
+    objc2_metal::MTLResourceOptions(MTLResourceOptions::StorageModePrivate.bits());
+
+pub const RESOURCE_OPTIONS_SHARED: MTLResourceOptions =
     objc2_metal::MTLResourceOptions(MTLResourceOptions::StorageModeShared.bits());
 //| MTLResourceOptions::HazardTrackingModeUntracked.bits(),
 //);
@@ -154,6 +161,16 @@ impl MetalDevice {
         Ok(command_encoder)
     }
 
+    /// Expose Candle's current command buffer to allow external encodes (e.g., MPSGraph)
+    /// to share the same scheduling/commit cadence as Candle's own kernels.
+    pub fn with_command_buffer<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&objc2::runtime::ProtocolObject<dyn objc2_metal::MTLCommandBuffer>) -> R,
+    {
+        let commands = self.commands.write().map_err(MetalError::from)?;
+        Ok(commands.with_command_buffer(f).map_err(MetalError::from)?)
+    }
+
     pub fn wait_until_completed(&self) -> Result<()> {
         let commands = self.commands.write().map_err(MetalError::from)?;
         commands.wait_until_completed().map_err(MetalError::from)?;
@@ -162,6 +179,35 @@ impl MetalDevice {
 
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
+    }
+
+    /// Borrow the raw Metal command queue (single queue for this device).
+    pub fn raw_command_queue(&self) -> Result<objc2::rc::Retained<ProtocolObject<dyn MTLCommandQueue>>> {
+        let commands = self.commands.read().map_err(MetalError::from)?;
+        Ok(commands.raw_command_queue().clone())
+    }
+
+    /// Create a brand-new command buffer that is not tracked by the pool.
+    /// Caller is responsible for commit/wait.
+    pub fn new_untracked_command_buffer(
+        &self,
+    ) -> Result<CommandBuffer> {
+        let commands = self.commands.read().map_err(MetalError::from)?;
+        Ok(commands
+            .new_untracked_command_buffer()
+            .map_err(MetalError::from)?)
+    }
+
+    /// Run a closure with a freshly created, untracked command buffer (no pool accounting).
+    /// Caller is responsible for commit/wait on the buffer.
+    pub fn with_command_buffer_untracked<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&ProtocolObject<dyn MTLCommandBuffer>) -> R,
+    {
+        let commands = self.commands.read().map_err(MetalError::from)?;
+        Ok(commands
+            .with_command_buffer_untracked(f)
+            .map_err(MetalError::from)?)
     }
 
     pub fn device(&self) -> &Device {
@@ -202,9 +248,31 @@ impl MetalDevice {
     /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
         let size = core::mem::size_of_val(data);
+        
+        // If using Private storage, we explicitly stage via a Shared buffer to avoid
+        // potential issues with large implicit copies or driver bugs.
+        if (RESOURCE_OPTIONS_DEFAULT.0 & MTLResourceOptions::StorageModePrivate.bits()) != 0 {
+            let src = self.device.new_buffer_with_data(
+                data.as_ptr().cast(),
+                size,
+                RESOURCE_OPTIONS_SHARED
+            ).map_err(MetalError::from)?;
+            
+            let dst = self.allocate_buffer(size)?;
+            let blit = self.blit_command_encoder()?;
+            blit.copy_from_buffer(&src, 0, &dst, 0, size);
+            // We do not end encoding here to allow batching, or we should?
+            // allocate_zeros ends it. Let's end it to be safe and ensure the copy is submitted/ready
+            // for subsequent compute commands that might use a different encoder.
+            // Actually, if we don't end it, the next compute command will trigger a switch anyway.
+            // But let's follow allocate_zeros pattern.
+            blit.end_encoding(); 
+            return Ok(dst);
+        }
+
         let new_buffer = self
             .device
-            .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
+            .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS_DEFAULT)
             .map_err(MetalError::from)?;
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
 
@@ -236,11 +304,20 @@ impl MetalDevice {
 
         let new_buffer = self
             .device
-            .new_buffer(size, RESOURCE_OPTIONS)
+            .new_buffer(size, RESOURCE_OPTIONS_DEFAULT)
             .map_err(MetalError::from)?;
         let new_buffer = Arc::new(new_buffer);
         subbuffers.push(new_buffer.clone());
         Ok(new_buffer)
+    }
+
+    /// Allocate a CPU-visible buffer for readback (Shared storage).
+    pub fn allocate_shared_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
+        let new_buffer = self
+            .device
+            .new_buffer(size, RESOURCE_OPTIONS_SHARED)
+            .map_err(MetalError::from)?;
+        Ok(Arc::new(new_buffer))
     }
 
     /// Create a metal GPU capture trace on [`path`].

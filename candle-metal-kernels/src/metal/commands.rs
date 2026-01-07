@@ -3,7 +3,8 @@ use crate::metal::{
 };
 use crate::MetalKernelError;
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
+use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue, MTLCommandBuffer};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -11,8 +12,39 @@ use std::sync::{Arc, Mutex};
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
-const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
-const DEFAULT_CANDLE_METAL_COMMAND_POOL_SIZE: usize = 5;
+// Favor fidelity by default: commit after every encoder unless overridden.
+// Callers can bump via CANDLE_METAL_COMPUTE_PER_BUFFER for throughput tuning.
+const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 1;
+const DEFAULT_CANDLE_METAL_COMMAND_POOL_SIZE: usize = 4;
+
+thread_local! {
+    // Optional override to force all with_command_buffer/encoder calls to use a caller-supplied
+    // command buffer (e.g., a step-long CB held by the inference engine). When set, pool selection,
+    // compute_count accounting, and implicit commits are bypassed.
+    static COMMAND_BUFFER_OVERRIDE: RefCell<Option<CommandBuffer>> = RefCell::new(None);
+}
+
+/// RAII guard that pushes a command-buffer override for the current thread. When active, any
+/// `with_command_buffer`/`command_encoder` invocation will borrow the provided CB instead of
+/// allocating/committing from the pool.
+pub struct CommandBufferOverrideGuard {
+    previous: Option<CommandBuffer>,
+}
+
+impl CommandBufferOverrideGuard {
+    pub fn new(cb: CommandBuffer) -> Self {
+        let previous = COMMAND_BUFFER_OVERRIDE.with(|slot| slot.replace(Some(cb)));
+        Self { previous }
+    }
+}
+
+impl Drop for CommandBufferOverrideGuard {
+    fn drop(&mut self) {
+        COMMAND_BUFFER_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = self.previous.clone();
+        });
+    }
+}
 
 /// Creates a new command buffer from the queue with an attached semaphore for tracking its state.
 pub fn create_command_buffer(
@@ -58,6 +90,9 @@ unsafe impl Sync for Commands {}
 impl Commands {
     pub fn new(command_queue: CommandQueue) -> Result<Self, MetalKernelError> {
         let compute_per_buffer = match std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER") {
+            Ok(val) if val.eq_ignore_ascii_case("max") || val.eq_ignore_ascii_case("infinite") => {
+                usize::MAX
+            }
             Ok(val) => val
                 .parse()
                 .unwrap_or(DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER),
@@ -99,17 +134,76 @@ impl Commands {
     }
 
     pub fn command_encoder(&self) -> Result<(bool, ComputeCommandEncoder), MetalKernelError> {
+        if let Some(cb) = COMMAND_BUFFER_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return Ok((false, cb.compute_command_encoder()));
+        }
         let entry = self.select_entry()?;
         self.finalize_entry(entry, |cb| cb.compute_command_encoder())
     }
 
     pub fn blit_command_encoder(&self) -> Result<(bool, BlitCommandEncoder), MetalKernelError> {
+        if let Some(cb) = COMMAND_BUFFER_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return Ok((false, cb.blit_command_encoder()));
+        }
         let entry = self.select_entry()?;
         self.finalize_entry(entry, |cb| cb.blit_command_encoder())
     }
 
+    /// Borrow the raw command queue (single queue for the device).
+    pub fn raw_command_queue(&self) -> &CommandQueue {
+        &self.command_queue
+    }
+
+    /// Create a brand-new command buffer that is not tracked by the pool.
+    /// Caller is responsible for commit/wait; no compute_count accounting is applied.
+    pub fn new_untracked_command_buffer(&self) -> Result<CommandBuffer, MetalKernelError> {
+        let semaphore = Arc::new(CommandSemaphore::new());
+        create_command_buffer(&self.command_queue, semaphore)
+    }
+
+    /// Run a closure with a freshly created, untracked command buffer.
+    /// No implicit commit/compute-count side effects; caller must manage completion.
+    pub fn with_command_buffer_untracked<F, R>(&self, f: F) -> Result<R, MetalKernelError>
+    where
+        F: FnOnce(&ProtocolObject<dyn MTLCommandBuffer>) -> R,
+    {
+        if let Some(cb) = COMMAND_BUFFER_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return Ok(f(cb.as_ref()));
+        }
+        let cb = self.new_untracked_command_buffer()?;
+        let out = f(cb.as_ref());
+        Ok(out)
+    }
+
     pub fn wait_until_completed(&self) -> Result<(), MetalKernelError> {
         self.flush_and_wait()
+    }
+
+    /// Run a closure with the current command buffer for the selected pool entry.
+    /// This participates in the same compute_per_buffer accounting and recycling as
+    /// encoder-based paths, so external encodes share the same commit cadence.
+    pub fn with_command_buffer<F, R>(&self, f: F) -> Result<R, MetalKernelError>
+    where
+        F: FnOnce(&ProtocolObject<dyn MTLCommandBuffer>) -> R,
+    {
+        if let Some(cb) = COMMAND_BUFFER_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return Ok(f(cb.as_ref()));
+        }
+        let entry = self.select_entry()?;
+        let mut state = entry.state.lock()?;
+
+        let count = entry.compute_count.fetch_add(1, Ordering::Relaxed);
+        let flush = count >= self.compute_per_buffer;
+        if flush {
+            self.commit_swap_locked(&entry, &mut state, 1)?;
+        }
+
+        let cb = state.current.clone();
+        drop(state);
+
+        let out = f(cb.as_ref());
+        entry.semaphore.set_status(CommandStatus::Available);
+        Ok(out)
     }
 
     // Selects an entry from the pool using a two-phase strategy:

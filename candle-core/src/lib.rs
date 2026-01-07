@@ -91,6 +91,9 @@ mod variable;
 #[cfg(feature = "cudnn")]
 pub use cuda_backend::cudnn;
 
+#[cfg(feature = "metal")]
+pub mod metal_ext;
+
 pub use cpu_backend::{CpuStorage, CpuStorageRef};
 #[cfg(feature = "ug")]
 pub use custom_op::UgIOp1;
